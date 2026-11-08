@@ -1,0 +1,63 @@
+# OS / Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.pytest_tmp/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# Virtual env
+.venv/
+venv/
+
+# Project runtime artifacts
+log.txt
+yolo/dataset_temp/
+yolo/finetune_temp/
+yolo/corrections/
+yolo/train/
+*.pt
+# Restoration weights, fetched on demand and licensed to their author.
+models/
+
+# Build artifacts
+build/
+dist/
+.build/
+docs/
+
+# Local credentials and environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+.claude/
+.superdesign/tmp/
+
+# Separate project, tracked on its own.
+native/
+
+# Local bundled/runtime modules. Keep public presets and module notes tracked.
+___DEVTOOLS___/
+modules/*/
+!modules/README.txt
+!modules/kcc_presets/
+!modules/kcc_presets/*.json
+!modules/kfxlib/
+
+# Local temporary files
+.tmp_*.txt
+__perm_test.txt
+tmp*/
+debug-*.log
+*.sidecar.json
+___compare_*.py
+test-artifacts/

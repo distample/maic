@@ -1,0 +1,2 @@
+# Installation tooling; updated before installing the ML wheels.
+pip==26.2.1

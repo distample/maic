@@ -1,0 +1,2 @@
+# Optional native window; browser mode needs no pywebview.
+pywebview>=6.0,<7

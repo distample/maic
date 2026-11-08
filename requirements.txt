@@ -1,0 +1,8 @@
+# Default desktop environment; install the Torch profile first.
+-c requirements/constraints-python314.txt
+-r requirements/bootstrap.txt
+-r requirements/core.txt
+-r requirements/ml.txt
+-r requirements/pdf.txt
+-r requirements/kcc.txt
+-r requirements/kfx.txt
