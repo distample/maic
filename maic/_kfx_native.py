@@ -1051,8 +1051,15 @@ def _resize_page_to_height(page, target_height, *, quality=85, fmt=None,
 
 
 def _content_canvas(page_groups):
-    """Largest content-page box, excluding the dedicated cover group."""
+    """Shared box for standalone pages, excluding cover and facing spreads.
+
+    Facing pairs have per-image viewports and never use this box. A wide
+    spread half must not enlarge it: fitting a 1400x1920 standalone page
+    inside a 1453x1920 box shrinks its height and adds horizontal bars.
+    Books with only facing pairs (or only a cover) still need a fallback.
+    """
     groups = page_groups[1:] or page_groups
+    groups = [group for group in groups if len(group) == 1] or groups
     return (
         max(int(page["width"]) for group in groups for page in group),
         max(int(page["height"]) for group in groups for page in group),
