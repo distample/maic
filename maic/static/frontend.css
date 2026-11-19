@@ -309,6 +309,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:0.85rem;he
 .status-dot.checking{background:var(--orange);animation:statusPulse 0.8s ease-in-out infinite;}
 
 /* Toolbar groups */
+.canvas-area.margin-picking,.canvas-area.margin-picking *{cursor:crosshair!important;}
 .tool-group{display:flex;align-items:center;gap:0.2rem;background:var(--glass);
   border:1px solid var(--glass-border);border-radius:var(--radius-xs);padding:2px;}
 .tool-group .tool-btn{border-radius:6px;}

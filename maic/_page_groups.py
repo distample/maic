@@ -300,9 +300,9 @@ def _pages_from_file(
     """
     from ._image_pipeline import (
         SPREAD_PREVIEW_DEEP_BLACK_THRESHOLD,
-        _resize_method, cropped_page_background, custom_split_plan, detect_fill, has_gradient_background, match_split_join,
+        _resize_method, add_black_fold_preview_signal, cropped_page_background, custom_split_plan, detect_fill, has_gradient_background, match_split_join,
         pad_to_even, resize_to_device, rotate_page, save_jpeg, split_at,
-        split_spread, spread_plan, spread_preview_edge_metrics,
+        split_spread, spread_plan, spread_preview_edge_metrics, uniform_padding_color,
         spread_preview_likely,
     )
 
@@ -424,6 +424,9 @@ def _pages_from_file(
             _log("CROP: failed on %s (%s)" % (rel, exc))
         else:
             if applied:
+                # Keep the field identity when cropping removes its only
+                # outside strip; artwork on the other side is not paper.
+                background_hint = cropped_page_background(image, cropped)
                 image = cropped
                 # Cutting is decided on the cropped page: trimming a wide scan's
                 # borders changes its ratio, and with it whether it is a spread.
@@ -450,11 +453,24 @@ def _pages_from_file(
             if canvas and split_spreads:
                 plan = spread_plan(size, canvas, rotate_spreads)
 
+    model_padding_fill = None
+    model_changed_image = False
+    automatic_padding = str(borders_color or "none").strip().lower() not in {"white", "black"}
+    if (rescale and not no_padding and not stretch and plan == "single" and not custom_split
+            and automatic_padding and (cleanup_kind or restore_kind)):
+        analysis = image.convert("L") if grayscale else image
+        model_padding_fill = uniform_padding_color(
+            analysis, canvas, fill=detect_fill(analysis, borders_color),
+            background_hint=background_hint, background_source=background_source, upscale=upscale,
+        )
+        del analysis
+
     if cleanup_kind:
         # Keep the established Exact pipeline order: crop first, restore JPEG
         # artifacts at 1x second, then let the selected upscaler run below.
         cleaned = scan_cleanup.apply(image, cleanup_kind)
         if cleaned is not image:
+            model_changed_image = True
             image = cleaned
             size = image.size
             touched = True
@@ -469,6 +485,7 @@ def _pages_from_file(
         # the resize below to bring the result to the canvas.
         restored = restore.apply(image, restore_kind)
         if restored is not image:
+            model_changed_image = True
             image = restored
             size = image.size
             touched = True
@@ -488,7 +505,12 @@ def _pages_from_file(
         image = image.convert("L")
         touched = True
 
-    fill = detect_fill(image, borders_color) if (rescale and not no_padding) else "white"
+    padding_locked = model_changed_image and model_padding_fill is not None
+    fill = "white"
+    if rescale and not no_padding:
+        fill = model_padding_fill if padding_locked else detect_fill(image, borders_color)
+    if padding_locked:
+        _log("PADDING: %s retains %s margins from the pre-model page" % (rel, fill))
 
     # Explicit mode supersedes the original boolean, while a direct caller
     # that still supplies only that boolean keeps exactly the old behaviour.
@@ -526,6 +548,14 @@ def _pages_from_file(
         reason = "auto correction" if preview_mode == 1 else "always"
         _log("SPREAD PREVIEW: %s matched %d px at %s=%d (%s; %s)"
              % (rel, band, axis, position, reason, signal))
+        # Matching equal black pixels cannot create a detectable join. The
+        # narrow near-black fallback is confined to virtually uniform folds;
+        # the helper leaves ordinary artwork byte-exact after normal matching.
+        marked = add_black_fold_preview_signal(source, axis, position)
+        if marked is not source:
+            _log("SPREAD PREVIEW: %s black-fold signal (1 px per side, "
+                 "fine grain 32/40%%; device-tested variant 03)" % rel)
+        source = marked
         return source
 
     # The user's own cut wins over the automatic one: they placed it because
@@ -580,7 +610,7 @@ def _pages_from_file(
                 spread_half=(plan == "split"),
                 no_padding=no_padding,
                 fill=fill,
-                edge_padding=str(borders_color or "none").strip().lower() not in {"white", "black"},
+                edge_padding=automatic_padding and not padding_locked,
                 background_hint=background_hint if plan == "single" else None,
                 background_source=background_source if plan == "single" else None,
                 upscale=upscale,

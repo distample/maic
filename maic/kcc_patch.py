@@ -1075,6 +1075,7 @@ def apply_nocrop_patch(
                 watermarks=bool(maic_watermarks),
                 skip_names=set(nocrop_kcc_names) | set(customcrop_kcc_map),
                 artifact_only_names=watermark_kcc_names,
+                background_colors=c2e.options.maic_crop_backgrounds,
                 stop_requested_fn=_is_stop_requested,
                 log_fn=convert_log,
             )

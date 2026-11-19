@@ -371,7 +371,10 @@ def _corner_mean(gray, *, left, top):
     return sum(value * amount for value, amount in enumerate(histogram)) / float(count)
 
 
-def _padding_gradient_side_depths(image, minimum_delta=160.0, maximum_step_ratio=0.04):
+def _padding_gradient_side_depths(
+    image, minimum_delta=160.0, maximum_step_ratio=0.04, minimum_support_ratio=0.05,
+    maximum_backtrack_ratio=0.35,
+):
     """Find textured side fields that are safe to extend, but not to crop.
 
     The crop detector is deliberately strict: a noisy screentone field is not
@@ -382,6 +385,8 @@ def _padding_gradient_side_depths(image, minimum_delta=160.0, maximum_step_ratio
 
     The default contrast is for black/white fields. A verified grey page
     background can use a lower threshold for a white/grey transition.
+    RGB endpoint normalization amplifies weak tonal changes; those callers
+    tighten ``maximum_backtrack_ratio`` to reject irregular drawn patches.
     """
     import math
 
@@ -437,6 +442,42 @@ def _padding_gradient_side_depths(image, minimum_delta=160.0, maximum_step_ratio
         ) > 64.0
         across_band = models.np.mean(contrast[:, :band], axis=1) >= 0.90
         across_page = models.np.mean(contrast, axis=1) >= 0.50
+        # A scanned frame can be tilted: its line reaches the outer field a
+        # few rows after the rest of the page. Different tones on either side
+        # of that frame belong to its panels, not one continuous page field.
+        nearby_page = models.np.convolve(
+            across_page.astype(models.np.int32), models.np.ones(2 * reach + 1, dtype=models.np.int32),
+            mode="same",
+        ) > 0
+        tilted_rules = models.np.flatnonzero(across_band & nearby_page) + reach
+        if tilted_rules.size:
+            groups = models.np.split(tilted_rules, models.np.flatnonzero(models.np.diff(tilted_rules) > 1) + 1)
+            outer_profile = models.np.median(rows[:, :min(band, 8)], axis=1)
+            span = max(8, round(height * 0.008))
+            direction = (1 if models.np.median(outer_profile[-span:])
+                         >= models.np.median(outer_profile[:span]) else -1)
+            for group in groups:
+                center = int(models.np.median(group))
+                if center - reach - 2 * span < 0 or center + reach + 2 * span > height:
+                    continue
+                before_far, before_near, after_near, after_far = (
+                    float(models.np.median(outer_profile[start:end]))
+                    for start, end in (
+                        (center - reach - 2 * span, center - reach - span),
+                        (center - reach - span, center - reach),
+                        (center + reach, center + reach + span),
+                        (center + reach + span, center + reach + 2 * span),
+                    )
+                )
+                trend = 0.5 * (before_near - before_far + after_far - after_near)
+                trend *= (span + 2 * reach) / span
+                restart = min(direction * (before_near - before_far),
+                              direction * (after_far - after_near)) < -8
+                # Curvature in a continuous gradient can exceed a linear
+                # prediction too. A local tonal restart provides the extra
+                # evidence that the border separates different panel fills.
+                if restart and abs(after_near - before_near - trend) >= 32:
+                    return True
         rules = models.np.flatnonzero(across_band & across_page) + reach
         if rules.size < 2:
             return False
@@ -477,8 +518,12 @@ def _padding_gradient_side_depths(image, minimum_delta=160.0, maximum_step_ratio
         support = int(models.np.sum(positive > 0.10))
         if (
             forward < minimum_delta
-            or backward > max(36.0, forward * 0.35)
-            or support < max(12, round(height * 0.05))
+            # Clouds, paving and other drawn patches can average into a
+            # convincing endpoint change while repeatedly reversing tone.
+            # Allow print grain and isolated rules, but not those broad
+            # reversals (Zelda Ocarina v2 ch18 p16).
+            or backward > max(36.0, forward * maximum_backtrack_ratio)
+            or support < max(12, round(height * minimum_support_ratio))
             or float(models.np.max(positive, initial=0.0)) > max(6.0, forward * maximum_step_ratio)
         ):
             return 0
@@ -498,6 +543,19 @@ def _padding_gradient_side_depths(image, minimum_delta=160.0, maximum_step_ratio
             return 0
         context_end = min(width, depth + max(6, round(width * 0.04)))
         if float(models.np.mean(~similar[depth:context_end])) < 0.50:
+            return 0
+        if _upper_panel_tone_returns_to_black(models.np.asarray(image.convert("RGB")), side):
+            return 0
+        # A smooth vertical average can hide flames, smoke and other drawn
+        # shapes. In a true side field the blurred tone also progresses in
+        # one direction across the band, even when its diagonal is curved.
+        # Repeated large horizontal reversals belong to artwork, not grain
+        # (Berserk v21 ch166 image014). Use the already blurred copy so dots
+        # and fine hatching do not count as those reversals.
+        band = columns[:depth]
+        reversals = (models.np.sum(models.np.abs(models.np.diff(band, axis=0)), axis=0)
+                     - models.np.abs(band[-1] - band[0])) * 0.5
+        if float(models.np.mean(reversals > 24.0)) >= 0.05:
             return 0
         if framed(side, depth):
             return 0
@@ -656,6 +714,70 @@ def _hard_field_side_transitions(image):
                 side: (split, top, bottom, side),
                 other_side: (other_split, top, bottom, other_side if local_field else side),
             }
+    # Both ends can contain full-bleed artwork. A long clean incoming field
+    # on one side still establishes the page when both edges change sharply
+    # together and their dark shoulders belong to one substantial connected
+    # background (Zelda Ocarina v1 ch5 p18). A thin panel outline alone cannot
+    # supply either the long shoulders or the connected dark area.
+    pixels = np.asarray(gray)
+    rgb = np.asarray(image.convert("RGB"))
+    outgoing_run = max(12, round(height * 0.10))
+    for reversed_view in (False, True):
+        measured = {side: profile[::-1] if reversed_view else profile for side, profile in profiles.items()}
+        dark_labels = dark_stats = None
+        for side, profile in measured.items():
+            top_white = bool(profile[0] >= 128)
+            crossings = np.flatnonzero((profile >= 128) != top_white)
+            if not crossings.size:
+                continue
+            split = int(crossings[0])
+            if not minimum_field <= split <= height - minimum_field:
+                continue
+            if not matches(profile[:split - antialias], top_white):
+                continue
+            other_side = "right" if side == "left" else "left"
+            other = measured[other_side]
+            candidates = np.flatnonzero(
+                ((other[:-1] >= 128) == top_white) & ((other[1:] >= 128) != top_white)
+            ) + 1
+            for other_split in candidates:
+                other_split = int(other_split)
+                if abs(other_split - split) > tolerance:
+                    continue
+                if not matches(other[other_split - shoulder:other_split - antialias], top_white):
+                    continue
+                tails = [values[start + antialias:start + outgoing_run]
+                         for values, start in ((profile, split), (other, other_split))]
+                if not all(values.size and float(np.mean(values <= 48 if top_white else values >= 232)) >= 0.98
+                           for values in tails):
+                    continue
+                if dark_labels is None:
+                    view = pixels[::-1] if reversed_view else pixels
+                    thick = models.cv2.erode((view <= 48).astype(np.uint8), np.ones((2, 2), dtype=np.uint8))
+                    _, dark_labels, dark_stats, _ = models.cv2.connectedComponentsWithStats(thick, connectivity=8)
+                def shoulder_labels(name, boundary):
+                    y0, y1 = ((boundary + antialias, boundary + shoulder) if top_white
+                              else (boundary - shoulder, boundary - antialias))
+                    x0 = 0 if name == "left" else width - band
+                    return set(np.unique(dark_labels[y0:y1, x0:x0 + band])) - {0}
+                common = shoulder_labels(side, split) & shoulder_labels(other_side, other_split)
+                if not any(dark_stats[label, models.cv2.CC_STAT_AREA] >= width * height * 0.05 for label in common):
+                    continue
+                view_rgb = rgb[::-1] if reversed_view else rgb
+                y0, y1 = ((split + antialias, split + outgoing_run) if top_white
+                          else (0, split - antialias))
+                x0 = 0 if side == "left" else width - band
+                patch = view_rgb[y0:y1, x0:x0 + band]
+                samples = patch[np.max(patch, axis=2) <= 48]
+                if not samples.size:
+                    continue
+                dark = _as_page_color(image, np.median(samples, axis=0))
+                top, bottom = ("white", dark) if top_white else (dark, "white")
+                if reversed_view:
+                    split, other_split = height - split, height - other_split
+                    top, bottom = bottom, top
+                return {side: (split, top, bottom, side),
+                        other_side: (other_split, top, bottom, side)}
     return None
 
 
@@ -756,9 +878,9 @@ def _horizontal_padding_plan(image, fill):
     extensions.  The source remains centred; only the two padding colours
     differ.
     """
-    # White manga frames can themselves occupy an outer corner. They are not
-    # evidence for a two-colour page field: without a verified gradient the
-    # global black background is the only safe continuation on both sides.
+    # White manga frames can themselves occupy an outer corner. Distinguish
+    # them from mostly light artwork along both sides before accepting the
+    # global black vote from a dark top or bottom band.
     from .autonomous import _horizontal_gradient_edge_depths, _vertical_gradient_side_depths
 
     crop_gradients = _vertical_gradient_side_depths(image)
@@ -778,21 +900,19 @@ def _horizontal_padding_plan(image, fill):
             return (fill, fill), vertical_gradients
         return (fill, fill), {"left": 0, "right": 0}
     horizontal_gradients = _horizontal_gradient_edge_depths(image)
-    if not any(horizontal_gradients.values()) and not any(vertical_gradients.values()):
-        if _ink_edges_are_not_textured_field(image, full_bleed=True):
-            solid = [_solid_dark_side_color(image, side, "black") for side in ("left", "right")]
-            if (solid[0] != "black") != (solid[1] != "black"):
-                # A genuine solid ink margin can coexist with full-bleed
-                # line art. Continue the solid side; give the drawing paper,
-                # rather than copying its strokes into a supposed field.
-                return tuple("black" if color != "black" else "white" for color in solid), vertical_gradients
-        return ("black", "black"), vertical_gradients
-
     gray = image.convert("L")
     left_edge = gray.crop((0, 0, 1, gray.height))
     right_edge = gray.crop((gray.width - 1, 0, gray.width, gray.height))
     left_dark = _dark_pixel_ratio(left_edge) >= 0.5
     right_dark = _dark_pixel_ratio(right_edge) >= 0.5
+
+    if not any(horizontal_gradients.values()) and not any(vertical_gradients.values()):
+        # A dark sky above light full-bleed artwork is not a black page field.
+        # Only confirmed fields may override paper beside two light sides;
+        # leave the drawing intact instead of extending it or its corner vote.
+        if not left_dark and not right_dark and _shared_page_background(image) is None:
+            return ("white", "white"), vertical_gradients
+        return ("black", "black"), vertical_gradients
 
     # A page such as ch2 p41 is globally voted black because of its cropped
     # top band, yet neither side is a black field.  Both added margins are
@@ -927,7 +1047,10 @@ def _shared_page_background(image):
         if background is not None:
             return background
         fields = _interrupted_page_fields(image)
-        return _as_page_color(image, fields[0][1]) if fields else None
+        if fields:
+            return _as_page_color(image, fields[0][1])
+        solid = _solid_dark_page_background(image)
+        return solid if solid is not None else _black_page_gutter_background(image)
     support = found["support"]
     # Either the shade holds most of both sides and a horizontal edge, or --
     # where display lettering and full-bleed artwork break those edges up, as
@@ -951,6 +1074,92 @@ def _shared_page_background(image):
     if float(np.min(candidate)) >= 232:
         return None
     return _as_page_color(image, candidate)
+
+
+def _solid_dark_page_background(image):
+    """One solid black side establishes the page field unless a transition exists.
+
+    Full-bleed artwork on the opposite side is not a white margin. Preserve
+    the field even if a later crop removes its whole outside strip.
+    """
+    from .autonomous import _horizontal_gradient_edge_depths, _vertical_gradient_side_depths
+
+    if _paper_edges(image):
+        return None
+    rgb = image.convert("RGB")
+    colors = [_solid_dark_side_color(rgb, side, "black") for side in ("left", "right")]
+    colors = [color for color in colors if color != "black" and max(color) <= 24]
+    if not colors:
+        return None
+    if (any(_vertical_gradient_side_depths(image).values())
+            or any(_horizontal_gradient_edge_depths(image).values())
+            or has_gradient_background(image)):
+        return None
+    if any(max(abs(a - b) for a, b in zip(colors[0], color)) > 8 for color in colors[1:]):
+        return None
+    return _as_page_color(image, colors[0])
+
+
+def _black_page_gutter_background(image):
+    """Confirm a black page through its frame rules and connected thick gutters.
+
+    A crop may remove its outside black margin. Thin outlines on white paper
+    do not establish a black page: an eroded dark component must dominate an
+    outside edge and join a broad interior gutter (Berserk v20 ch158 image077).
+    """
+    from . import models
+
+    if _paper_edges(image):
+        return None
+    if _hard_field_side_transitions(image) is not None:
+        # Connected black gutters can belong to just one part of a page.
+        # Preserve the confirmed white/dark transition instead of turning
+        # that local field into a full-height pre-crop background hint.
+        return None
+    models._ensure_imports()
+    np, cv2 = models.np, models.cv2
+    rgb = np.asarray(image.convert("RGB"))
+    gray = np.asarray(image.convert("L"))
+    height, width = gray.shape
+    reach = max(2, round(height * 0.0025))
+    if width < 40 or height < 4 * reach:
+        return None
+    values = gray.astype(np.float32)
+    rules = (np.minimum(np.abs(values[reach:-reach] - values[:-2 * reach]),
+                        np.abs(values[reach:-reach] - values[2 * reach:])) > 64)
+    rules &= gray[reach:-reach] <= 24
+    if float(np.max(np.mean(rules, axis=1))) < 0.25:
+        return None
+    kernel = max(3, round(min(width, height) * 0.006))
+    thick = cv2.erode((gray <= 24).astype(np.uint8), np.ones((kernel, kernel), dtype=np.uint8))
+    _count, labels, _stats, _centers = cv2.connectedComponentsWithStats(thick, connectivity=8)
+    outside = set(np.unique(labels[:, 0])) | set(np.unique(labels[:, -1]))
+    outside.discard(0)
+    inset_x, inset_y = max(1, round(width * 0.10)), max(1, round(height * 0.10))
+    minimum_gutter = max(3, round(height * 0.006))
+    for label in outside:
+        # A black wing, hair or other solid drawing can join a panel border
+        # and reach the edge without defining the page background. Require
+        # this same thick component to own most of an outside edge before
+        # its interior gutter can establish a full-height black field
+        # (Zelda Ocarina v1 ch5 p8).
+        if max(float(np.mean(labels[:, 0] == label)), float(np.mean(labels[:, -1] == label))) < 0.60:
+            continue
+        rows = np.sum(labels[inset_y:height - inset_y, inset_x:width - inset_x] == label, axis=1) >= width * 0.25
+        if rows.size < minimum_gutter or not np.any(
+            np.convolve(rows.astype(np.int32), np.ones(minimum_gutter, dtype=np.int32), mode="valid") >= minimum_gutter
+        ):
+            continue
+        # A real edge gradient can share a connected black gutter with the
+        # panels. It still owns its side, including after a manual crop;
+        # do not turn that into a solid background hint (Jigokuraku ch2 p6).
+        from .autonomous import _vertical_gradient_side_depths
+
+        if any(_vertical_gradient_side_depths(image).values()) or any(_padding_gradient_side_depths(image).values()):
+            return None
+        edge_pixels = np.concatenate((rgb[labels[:, 0] == label, 0], rgb[labels[:, -1] == label, -1]))
+        return _as_page_color(image, np.median(edge_pixels, axis=0))
+    return None
 
 
 def _uniform_gray_page_background(image):
@@ -994,13 +1203,21 @@ def _uniform_gray_page_background(image):
 
 
 def cropped_page_background(source, cropped):
-    """Keep the verified pre-crop background for an explicit manual crop.
+    """Keep the verified pre-crop background after a margin crop.
 
     Moving the crop handles may remove the field completely. Its identity
     still comes from the original page, rather than the new artwork edge.
     Return RGB so the hint can cross a later greyscale conversion.
     """
-    return _shared_page_background(source.convert("RGB"))
+    source = source.convert("RGB")
+    background = _shared_page_background(source)
+    # A black scan border around white paper is not an inter-panel field.
+    # Keep established grey/coloured page backgrounds when all their field
+    # was removed, but do not let the solid-side fallback repaint real paper.
+    if (background is not None and max(background) <= 24 and _paper_edges(cropped)
+            and _black_page_gutter_background(source) is None):
+        return None
+    return background
 
 
 def _neutral_color_page_fields(image):
@@ -1064,7 +1281,7 @@ def _neutral_color_page_field(image):
     return _as_page_color(image, np.mean([shade for _, shade in fields], axis=0))
 
 
-def _ink_edges_are_not_textured_field(image, *, full_bleed=False):
+def _ink_edges_are_not_textured_field(image):
     """Distinguish monochrome ink/JPEG fringes from dark background grain."""
     import numpy as np
 
@@ -1084,14 +1301,6 @@ def _ink_edges_are_not_textured_field(image, *, full_bleed=False):
     levels = np.mean(values, axis=1)
     dark = levels[levels <= 32]
     ink_share = float(np.mean(dark <= 3)) if dark.size else 0.0
-    if full_bleed and not (
-        ink_share < 0.90 and np.mean(levels >= 232) >= 0.20
-        and np.mean((levels > 32) & (levels < 232)) >= 0.12
-    ):
-        # Crisp black page fields with white frames keep their established
-        # black padding. Dense antialiased strokes reaching the edge are a
-        # different case; their lighter tones are drawing/JPEG fringes.
-        return False
     return bool(dark.size and ink_share >= 0.75 and np.mean(levels >= 232) >= 0.10)
 
 
@@ -1437,6 +1646,59 @@ def _field_without_edge_ink(field, direction, columns, tolerance=16.0):
     return field if healed is None else healed
 
 
+def _horizontal_field_chroma_slope(pixels, start, width):
+    """Separate a stable horizontal colour trend from vertical tone/grain."""
+    import numpy as np
+
+    if pixels.ndim != 3 or pixels.shape[2] < 3 or width < 3:
+        return None
+    cap = max(2, min(24, pixels.shape[0] // 20))
+    top = np.median(pixels[:cap, start:start + width, :3], axis=0)
+    bottom = np.median(pixels[-cap:, start:start + width, :3], axis=0)
+    axis = np.mean(bottom - top, axis=0)
+    norm = float(np.dot(axis, axis))
+    if norm < 32 ** 2:
+        return None
+    x = np.arange(width, dtype=float) - (width - 1) / 2
+    denominator = float(np.dot(x, x))
+    slopes = []
+    for colors in (top, bottom):
+        orthogonal = colors - np.outer(colors @ axis / norm, axis)
+        slopes.append(np.sum(x[:, None] * orthogonal, axis=0) / denominator)
+    slope = (slopes[0] + slopes[1]) / 2
+    if float(np.max(np.abs(slope))) * width < 4:
+        return None
+    if float(np.linalg.norm(slopes[0] - slopes[1])) > max(0.025, float(np.linalg.norm(slope)) * 0.25):
+        return None
+    return slope
+
+
+def _completed_gradient_paper_tail(field):
+    """Locate paper separating a completed gradient from later edge artwork."""
+    import numpy as np
+
+    gray = np.asarray(field.convert("L"))
+    height = field.height
+    cap = max(2, round(height * 0.05))
+    if float(np.median(gray[:cap])) > 48:
+        return None
+    paper = np.mean(gray >= 245, axis=1) >= 0.98
+    positions = np.flatnonzero(paper)
+    groups = np.split(positions, np.flatnonzero(np.diff(positions) > 1) + 1)
+    minimum_run = max(3, round(height * 0.05))
+    row_levels = np.mean(gray, axis=1)
+    for group in groups:
+        if group.size < minimum_run or group[0] < height * 0.10:
+            continue
+        # Thin rules and scan specks already have their own cleanup. This
+        # requires a broad drawing after a real paper gap, such as the egg
+        # touching the edge below the gradient on Berserk v21 ch173 p160.
+        if np.count_nonzero(row_levels[int(group[-1]) + 1:] < 232) < minimum_run:
+            continue
+        return int(group[0])
+    return None
+
+
 def _gradient_side_extension(
     image,
     side,
@@ -1543,6 +1805,16 @@ def _gradient_side_extension(
         slope = max(-3.0, min(3.0, float(slope_override)))
 
     extension = Image.new(image.mode, (extension_width, height))
+    paper_tail = _completed_gradient_paper_tail(field) if clean_profile and analysis_image is None else None
+
+    def finish_extension():
+        if paper_tail is not None:
+            # The completed paper field owns the padding below this point.
+            # Leave the gradient front, its slope and its texture unchanged;
+            # later artwork belongs only to the original page.
+            extension.paste("white", (0, paper_tail, extension_width, height))
+        return extension if extension.mode == mode else extension.convert(mode)
+
     if clean_profile:
         # Average out the stipple, then use isotonic regression to remove panel
         # separators and scan lines from the background model.  Those marks
@@ -1750,6 +2022,26 @@ def _gradient_side_extension(
             patch_width = max(1, min(24, usable // 2)) if textured else usable
             overlap = min(8, max(2, patch_width // 4), patch_width - 1)
             stride = patch_width - overlap
+            if textured:
+                import numpy as np
+
+                # A broad field measured at its tonal front can contain
+                # nearby artwork farther down the page. Take texture donors
+                # from the outer rim, where the new margin actually joins.
+                donor_depth = min(usable, max(2 * patch_width, 64))
+                texture_pixels = np.asarray(clean_field, dtype=np.float32)
+                boundary = depth - 1 + round(edge_offset) if side == "right" else round(edge_offset)
+                boundary = max(0, min(depth - guard - 1 if side == "left" else depth - 1, boundary))
+                # A manual crop can move this boundary inside the original
+                # field. Keep its surrounding colours in the donor window.
+                donor_start = (max(guard, min(depth - donor_depth, boundary)) if side == "right"
+                               else max(0, min(usable - donor_depth, boundary - donor_depth + 1)))
+                crop_neighbor = boundary + 1 if side == "right" else boundary - patch_width
+                raw_boundary = depth - 1 + round(edge_offset) if side == "right" else round(edge_offset)
+                crop_neighbor = (crop_neighbor if edge_offset and boundary == raw_boundary
+                                 and donor_start <= crop_neighbor <= donor_start + donor_depth - patch_width
+                                 else None)
+                chroma_slope = _horizontal_field_chroma_slope(texture_pixels, donor_start, donor_depth)
             for outward in range(0, extension_width, stride):
                 # Always use the same full patch; clipping a partial last
                 # patch must not change the source phase as crop handles move.
@@ -1780,7 +2072,37 @@ def _gradient_side_extension(
                     rng = random.Random(1729 + outward * 104729)
                     block_height, row_overlap = 40, 8
                     for target_y in range(0, height, block_height - row_overlap):
-                        source_start = (guard if side == "right" else 0) + rng.randrange(usable - patch_width + 1)
+                        source_start = donor_start + rng.randrange(donor_depth - patch_width + 1)
+                        local_profile = clean_monotonic[target_y:min(height, target_y + block_height)]
+                        # Phase matching is for the grain, not the steep tonal
+                        # front: selecting donors there would move its slope.
+                        if outward == 0 and crop_neighbor is not None:
+                            # These verified field pixels were removed by the
+                            # crop. They are already the true neighbours of
+                            # its new edge, including horizontally varying RGB.
+                            source_start = crop_neighbor
+                        elif outward == 0 and max(local_profile) - min(local_profile) <= 24:
+                            # Match the donor column immediately *outside* the
+                            # patch to the real edge. Its preceding/following
+                            # columns then continue the lines in forward order.
+                            # A mirrored edge blend would reverse those lines.
+                            starts = (range(donor_start + 1, donor_start + donor_depth - patch_width + 1) if side == "right"
+                                      else range(donor_start, donor_start + donor_depth - patch_width))
+                            target_rows = np.arange(target_y, min(height, target_y + block_height))
+                            best_score = None
+                            for candidate in starts:
+                                matching_x = candidate - 1 if side == "right" else candidate + patch_width
+                                anchor = candidate if side == "right" else candidate + patch_width - 1
+                                candidate_shift = round(slope * (anchor_target - reference_x)
+                                                        - source_slope * (anchor - boundary_field_x))
+                                source_rows = np.clip(target_rows - candidate_shift, 0, height - 1)
+                                sample = texture_pixels[source_rows, matching_x]
+                                if chroma_slope is not None:
+                                    sample = sample.copy()
+                                    sample[:, :3] += chroma_slope * (boundary - matching_x)
+                                score = float(np.mean(np.abs(sample - texture_pixels[target_rows, boundary])))
+                                if best_score is None or score < best_score:
+                                    best_score, source_start = score, candidate
                         source_anchor = source_start if side == "right" else source_start + patch_width - 1
                         # Continue one measured tonal plane. The donor changes
                         # only the grain, not the position of the gradient front.
@@ -1796,7 +2118,14 @@ def _gradient_side_extension(
                                     selector = ((y * 1103515245 + (outward + local_x) * 12345) & 0xFFFF) / 65535
                                     if selector >= (local_y + 1) / (row_overlap + 1):
                                         continue
-                                tile.putpixel((local_x, y), donor.getpixel((local_x, source_y)))
+                                pixel = donor.getpixel((local_x, source_y))
+                                if chroma_slope is not None:
+                                    distance = outward + (local_x if side == "right" else patch_width - 1 - local_x)
+                                    target_x = raw_boundary + (distance if side == "right" else -distance)
+                                    correction = chroma_slope * (target_x - source_start - local_x)
+                                    pixel = tuple(max(0, min(255, round(pixel[c] + correction[c])))
+                                                  for c in range(3)) + tuple(pixel[3:])
+                                tile.putpixel((local_x, y), pixel)
                 if outward and overlap:
                     for i in range(overlap):
                         local_x = i if side == "right" else patch_width - overlap + i
@@ -1820,8 +2149,9 @@ def _gradient_side_extension(
                                               for a, b in zip(old_pixel, new_pixel))
                             tile.putpixel((local_x, y), pixel)
                 extension.paste(tile, (output_start, 0))
-            # A short pixel quilt joins the forward patch to the exact edge
-            # without averaging away its grain or leaving a hard vertical seam.
+            # Keep the exact boundary column without reflecting neighbouring
+            # texture columns back into the extension. Smooth fields can still
+            # blend their low-frequency colour across a short seam.
             seam_span = min(8, extension_width)
             for distance in range(seam_span):
                 output_x = distance if side == "right" else extension_width - 1 - distance
@@ -1841,10 +2171,9 @@ def _gradient_side_extension(
                         )
                         extension.putpixel((output_x, y), pixel)
                         continue
-                    selector = ((y * 1103515245 + distance * 12345) & 0xFFFF) / 65535
-                    if distance == 0 or selector >= distance / max(1, seam_span - 1):
+                    if distance == 0:
                         extension.putpixel((output_x, y), clean_field.getpixel((source_x, y)))
-            return extension if extension.mode == mode else extension.convert(mode)
+            return finish_extension()
 
         patch_start = None
         if textured and slope_override is not None and extension_width < depth:
@@ -2054,7 +2383,7 @@ def _gradient_side_extension(
                         column.putpixel((0, y), texture_pixel)
 
             extension.paste(column, (output_x, 0))
-        return extension if extension.mode == mode else extension.convert(mode)
+        return finish_extension()
 
     period = max(1, depth * 2 - 2)
     span = depth if extension_width > depth else min(depth, extension_width)
@@ -2131,6 +2460,64 @@ def _shared_gradient_plane_slope(image, left_depth, right_depth):
     return max(-3.0, min(3.0, (right[0] - left[0]) / float(width - 1)))
 
 
+def _upper_panel_tone_returns_to_black(rgb, side):
+    """Reject upper artwork that ends in the page's repeated black gutters."""
+    import numpy as np
+
+    height, width = rgb.shape[:2]
+    band = max(2, min(8, round(width * 0.006)))
+    edge = rgb[:, :band] if side == "left" else rgb[:, -band:]
+    dark_rows = np.mean(np.max(edge, axis=2) <= 24, axis=1) >= 0.98
+    changes = np.flatnonzero(~dark_rows)
+    if not changes.size or changes[-1] >= height * 0.5:
+        return False
+    # One broad dark region can be a real gradient endpoint. Multiple
+    # full-width gutters below its end establish a framed black page instead
+    # (Berserk v21 ch172 image151). Do not reject the opposite case: a lower
+    # gradient emerging from a black upper field keeps its existing rules.
+    rows = np.mean(np.max(rgb, axis=2) <= 24, axis=1) >= 0.98
+    inset = max(1, round(height * 0.10))
+    rows[:max(inset, int(changes[-1]) + 1)] = False
+    rows[height - inset:] = False
+    positions = np.flatnonzero(rows)
+    groups = np.split(positions, np.flatnonzero(np.diff(positions) > 1) + 1)
+    minimum_gutter = max(3, round(height * 0.006))
+    return sum(group.size >= minimum_gutter for group in groups) >= 2
+
+
+def _bright_field_has_edge_outline(rgb, side, top, bottom):
+    """A long dark outline crossing a light field is drawing, not its grain."""
+    import numpy as np
+    from . import models
+
+    darkest_endpoint = min(float(np.dot(color, (0.299, 0.587, 0.114))) for color in (top, bottom))
+    if darkest_endpoint < 96:
+        return False
+    height, width = rgb.shape[:2]
+    band = max(8, round(width * 0.06))
+    edge = rgb[:, :band] if side == "left" else rgb[:, ::-1][:, :band]
+    gray = np.sum(edge * np.array((0.299, 0.587, 0.114)), axis=2)
+    # Scanned outlines can be antialiased dark grey rather than near black.
+    # Keep the contrast against both field endpoints, but include those grey
+    # links so a coherent contour is not broken into harmless-looking dots
+    # (Zelda Ocarina v2 ch16 p24).
+    ink = (gray <= min(80, darkest_endpoint - 64)).astype(np.uint8)
+    if not np.any(ink[:, 0]):
+        return False
+    models._ensure_imports()
+    _count, _labels, stats, _centers = models.cv2.connectedComponentsWithStats(ink, connectivity=8)
+    for x, _y, stroke_width, stroke_height, area in stats[1:]:
+        if (x == 0 and stroke_width >= band * 0.75
+                and stroke_height >= max(8, height * 0.01)
+                and area < stroke_width * stroke_height * 0.25):
+            # A coherent thin contour can cross the edge diagonally and be
+            # shifted by texture sampling (Berserk v24 ch202 image119).
+            # Tiny stipple dots and a flat horizontal frame rule do not
+            # satisfy both the span and low bounding-box coverage checks.
+            return True
+    return False
+
+
 def _gradient_color_axis(image, side):
     """Measure progress between the edge's actual RGB endpoints.
 
@@ -2158,9 +2545,13 @@ def _gradient_color_axis(image, side):
         # frame. A tonal transition on the opposite drawing edge belongs to
         # the panel (Berserk v13 ch84 image084), not to that page margin.
         return None
+    if _upper_panel_tone_returns_to_black(rgb, side):
+        return None
     top, bottom = [np.median(part, axis=(0, 1)) for part in (edge[:cap], edge[-cap:])]
     delta = bottom - top
     if float(np.max(np.abs(delta))) < 32:
+        return None
+    if _bright_field_has_edge_outline(rgb, side, top, bottom):
         return None
     solid = _edge_background_candidate(image)
     if solid is not None and (
@@ -2198,15 +2589,112 @@ def _background_reference_box(source):
     return 0, 0, source.width, source.height
 
 
+def _has_dark_field_above_gradient(image, side):
+    """Two solid dark sides confirm a sharp change above a fading grey tail."""
+    import numpy as np
+
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    band = max(3, min(12, round(width * 0.006)))
+    edges = {name: np.asarray(rgb.crop(box), dtype=np.float32)
+             for name, box in (("left", (0, 0, band, height)),
+                               ("right", (width - band, 0, width, height)))}
+    splits = {}
+    for name, edge in edges.items():
+        black_rows = np.mean(np.max(edge, axis=2) <= 24, axis=1) >= 0.98
+        changes = np.flatnonzero(~black_rows)
+        if not changes.size:
+            return False
+        split = int(changes[0])
+        if not height * 0.15 <= split <= height * 0.80:
+            return False
+        splits[name] = split
+    if abs(splits["left"] - splits["right"]) > max(3, round(height * 0.02)):
+        return False
+    split = splits[side]
+    cap = max(3, round(height * 0.05))
+    start = split + max(2, round(height * 0.01))
+    top = np.median(edges[side][start:start + cap], axis=(0, 1))
+    bottom = np.median(edges[side][-cap:], axis=(0, 1))
+    return bool(np.min(top) >= 64 and np.max(top - bottom) >= 32)
+
+
 def has_gradient_background(image):
     """Whether the uncropped page has a verified field worth preserving."""
     if any(_padding_gradient_side_depths(image).values()):
         return True
     for side in ("left", "right"):
         axis = _gradient_color_axis(image, side)
-        if axis is not None and _padding_gradient_side_depths(axis, maximum_step_ratio=0.08).get(side, 0):
+        support = 0.03 if _has_dark_field_above_gradient(image, side) else 0.05
+        if axis is not None and _padding_gradient_side_depths(
+            axis, maximum_step_ratio=0.08, minimum_support_ratio=support, maximum_backtrack_ratio=0.25,
+        ).get(side, 0):
             return True
     return False
+
+
+def _align_horizontal_dark_prefix(image, side, depth, extension, edge_offset=0.0):
+    """Keep a verified sharp black-to-grey edge independent of grain shifts."""
+    import numpy as np
+    from PIL import Image
+
+    width, height = image.size
+    edge_x = round(edge_offset) if side == "left" else width - 1 + round(edge_offset)
+    if not 0 <= edge_x < width:
+        return extension
+    if (side == "left" and edge_x >= depth) or (side == "right" and edge_x < width - depth):
+        return extension
+    band = min(depth, 64)
+    x0, x1 = ((edge_x, min(depth, edge_x + band)) if side == "left"
+              else (max(width - depth, edge_x - band + 1), edge_x + 1))
+    gray = np.asarray(image.crop((x0, 0, x1, height)).convert("L"))
+    light = gray > 24
+    sustained = max(3, round(height * 0.0015))
+    if gray.shape[1] < 3 or height < sustained:
+        return extension
+    sums = np.concatenate((np.zeros((1, light.shape[1]), dtype=np.int32),
+                           np.cumsum(light, axis=0, dtype=np.int32)))
+    held = (sums[sustained:] - sums[:-sustained]) == sustained
+    if not np.all(np.any(held, axis=0)):
+        return extension
+    crossings = np.argmax(held, axis=0)
+    tolerance = max(1, round(height * 0.001))
+    center = float(np.median(crossings))
+    consistent = np.abs(crossings - center) <= tolerance
+    if float(np.mean(consistent)) < 0.95:
+        # An angled tonal front is part of the gradient and must keep its tilt.
+        # A few scan specks in the solid field cannot define that front.
+        return extension
+    positions = np.arange(crossings.size)[consistent].astype(float)
+    values = crossings[consistent].astype(float)
+    positions -= positions.mean()
+    denominator = float(np.sum(positions ** 2))
+    slope = float(np.sum(positions * (values - values.mean()))) / denominator if denominator else 0.0
+    if abs(slope) * extension.width > 0.5:
+        # Even a shallow source tilt becomes visible across a wider margin.
+        return extension
+    profile = image.crop((edge_x, 0, edge_x + 1, height))
+    levels = np.asarray(profile.convert("L"))[:, 0]
+    split = int(np.argmax(levels > 24))
+    if not height * 0.15 <= split <= height * 0.80 or abs(split - center) > tolerance:
+        return extension
+    cap = max(3, round(height * 0.05))
+    start = split + max(2, round(height * 0.01))
+    outgoing = float(np.median(gray[start:start + cap]))
+    if not 64 <= outgoing < 232:
+        # Black-to-paper fields already have their own edge handling. In
+        # particular, the good left side of Berserk v17 ch127 p122 stays intact.
+        return extension
+    limit = max(2, round(height * 0.003))
+    bright = np.flatnonzero(levels[split:split + limit] >= max(64, outgoing * 0.75))
+    if not bright.size:
+        return extension
+    end = split + int(bright[0]) + 1
+    fixed = extension.copy()
+    # Repeat the actual edge's RGB tone and antialias rows horizontally. The
+    # quilt below this short transition retains all its gradient and grain.
+    fixed.paste(profile.crop((0, 0, 1, end)).resize((extension.width, end), Image.Resampling.NEAREST), (0, 0))
+    return fixed
 
 
 def _pad_to_canvas(image, canvas, method, fill, edge_padding=False, background_hint=None, background_source=None):
@@ -2231,6 +2719,7 @@ def _pad_to_canvas(image, canvas, method, fill, edge_padding=False, background_h
         if width <= 0:
             continue
         axis = _gradient_color_axis(analysis_source, side)
+        normalized_axis = axis is not None
         legacy_plan = None
         if axis is None:
             colors, depths = _horizontal_padding_plan(analysis_source, fill)
@@ -2249,8 +2738,15 @@ def _pad_to_canvas(image, canvas, method, fill, edge_padding=False, background_h
             # The same validated black/white field path serves manual crops
             # and untouched pages, rather than switching to mirrored repeats.
             axis = analysis_source.convert("L")
+        # A confirmed black upper field can end sharply above a gradual grey
+        # fade. Count that shorter upward transition only when both physical
+        # margins establish the dark field; retain every width and ink guard.
+        support = 0.03 if _has_dark_field_above_gradient(analysis_source, side) else 0.05
         depth = (legacy_plan.get(side, 0) if legacy_plan is not None
-                 else _padding_gradient_side_depths(axis, maximum_step_ratio=0.08).get(side, 0))
+                 else _padding_gradient_side_depths(
+                     axis, maximum_step_ratio=0.08, minimum_support_ratio=support,
+                     maximum_backtrack_ratio=0.25 if normalized_axis else 0.35,
+                 ).get(side, 0))
         if not depth:
             continue
         if gradient_reference is None:
@@ -2267,8 +2763,9 @@ def _pad_to_canvas(image, canvas, method, fill, edge_padding=False, background_h
             shared_slope = _shared_gradient_plane_slope(
                 gradient_reference, round(legacy_plan["left"] * scale), round(legacy_plan["right"] * scale),
             )
+        scaled_depth = round(depth * gradient_reference.width / analysis_source.width)
         extension = _gradient_side_extension(
-            gradient_reference, side, round(depth * gradient_reference.width / analysis_source.width),
+            gradient_reference, side, scaled_depth,
             (width, canvas[1]), fitted.mode,
             clean_profile=bool(legacy_plan.get(side + "_clean")) if legacy_plan is not None else True,
             preserve_texture_direction=legacy_plan is None,
@@ -2277,6 +2774,10 @@ def _pad_to_canvas(image, canvas, method, fill, edge_padding=False, background_h
             edge_offset=edge_offset,
         )
         if extension is not None:
+            if support < 0.05 and legacy_plan is None:
+                extension = _align_horizontal_dark_prefix(
+                    gradient_reference, side, scaled_depth, extension, edge_offset,
+                )
             padded.paste(extension, (x0, 0))
     return padded
 
@@ -2506,6 +3007,45 @@ def resize_to_device(
     return ImageOps.contain(image, canvas, method=method)
 
 
+def uniform_padding_color(image, canvas, *, fill="white", background_hint=None,
+                          background_source=None, upscale=True):
+    """Return a confirmed plain black/white canvas fill, or ``None``.
+
+    Neural cleanup can change ink statistics enough to invent a textured
+    page field. Inspect the actual pre-model padding, including crop hints
+    and gradients, so plain margins can retain their preview colour while
+    the original page still receives the requested model processing.
+    """
+    from PIL import ImageOps
+
+    canvas = int(canvas[0]), int(canvas[1])
+    fitted_width, fitted_height = ImageOps.contain(image, canvas, method=_resize_method(image, canvas)).size
+    if (fitted_width, fitted_height) == canvas:
+        return None
+    padded = resize_to_device(image, canvas, fill=fill, edge_padding=True,
+                              background_hint=background_hint, background_source=background_source,
+                              upscale=upscale)
+    if padded.size != canvas:
+        return None
+    center_x, center_y = _padding_centering(image, canvas, fill)
+    left = int((canvas[0] - fitted_width) * center_x)
+    top = int((canvas[1] - fitted_height) * center_y)
+    right, bottom = left + fitted_width, top + fitted_height
+    colors = []
+    for x0, y0, x1, y1 in ((0, 0, left, canvas[1]), (right, 0, canvas[0], canvas[1]),
+                          (left, 0, right, top), (left, bottom, right, canvas[1])):
+        if x1 <= x0 or y1 <= y0:
+            continue
+        extrema = padded.crop((x0, y0, x1, y1)).convert("RGB").getextrema()
+        if extrema == ((255, 255),) * 3:
+            colors.append("white")
+        elif extrema == ((0, 0),) * 3:
+            colors.append("black")
+        else:
+            return None
+    return colors[0] if colors and len(set(colors)) == 1 else None
+
+
 def pad_to_even(image):
     """Duplicate the last row or column so a spread bisects into equal halves.
 
@@ -2668,6 +3208,87 @@ def spread_preview_edge_metrics(image, axis, position):
         "joint_ink": joint_ink, "solid_ink": solid_ink,
         "continuity": continuity, "deep_black": deep_black,
     }
+
+
+def add_black_fold_preview_signal(image, axis, position):
+    """Give an otherwise featureless black join a minimal matching signal.
+
+    Darker-pixel matching is a no-op on Berserk 19 image170-171: all eight
+    inner columns are level 1 after the common resize. Physical Kindle tests
+    rejected the old level-8 dashes and found level-32 dashes visible. The
+    low-visibility probe's variant 03 succeeded: level 32, ONE pixel per side,
+    51 separated rows per 128 (40%), fixed noise seed 170171. Keep that exact
+    device-tested pattern; see kfx_uniform_black_fold_device_probe.json.
+    Use it only when
+    >=98% of the narrow band is deep black and its central 90% spans <=4
+    levels. Ordinary artwork and textured black folds keep the normal match.
+
+    This intentionally lifts a few near-black output pixels, unlike
+    match_split_join. Never alter source files, geometry, non-black rows or
+    pixels outside one column per side. Device acceptance of a new source
+    still needs a physical check; this is not a per-spread metadata flag.
+    """
+    axis = str(axis or "").strip().lower()
+    try:
+        position = int(position)
+    except (TypeError, ValueError):
+        return image
+    if axis not in {"x", "y"} or image.mode not in {"L", "RGB"}:
+        return image
+    extent = image.width if axis == "x" else image.height
+    band = min(4, position, extent - position)
+    if band <= 0:
+        return image
+    box = ((position - band, 0, position + band, image.height)
+           if axis == "x" else
+           (0, position - band, image.width, position + band))
+    histogram = image.crop(box).convert("L").histogram()
+    total = sum(histogram)
+    if not total or sum(histogram[:16]) < 0.98 * total:
+        return image
+
+    def percentile(fraction):
+        count = 0
+        for value, amount in enumerate(histogram):
+            count += amount
+            if count >= fraction * total:
+                return value
+        return 255
+
+    low, high = percentile(0.05), percentile(0.95)
+    if high - low > 4:
+        return image
+    import numpy as np
+
+    shade = 32
+    # Byte-exact row selection from the successful native-pipeline variant
+    # "thin32", not long 13-row dashes or a newly randomized pattern.
+    selected = set(np.random.default_rng(170171).permutation(
+        np.arange(0, 128, 2))[:51].tolist())
+    length = image.height if axis == "x" else image.width
+    out = None
+    for row in range(length):
+        if row % 128 not in selected:
+            continue
+        pairs = [(((position - 1 - k, row), (position + k, row))
+                  if axis == "x" else
+                  ((row, position - 1 - k), (row, position + k)))
+                 for k in range(band)]
+        values = [(image.getpixel(a), image.getpixel(b)) for a, b in pairs]
+        channels = [v if isinstance(v, tuple) else (v,)
+                    for pair in values for v in pair]
+        if any(max(v) >= 16 for v in channels):
+            continue  # no dots on real linework, paper or coloured highlights
+        if out is None:
+            out = image.copy()
+        # Inspect the wider near-black context above, but paint only the
+        # single innermost pixel on each side. Never add page-edge markers.
+        for (a, b), (left, right) in zip(pairs[:1], values[:1]):
+            shared = (tuple(max(x, y, shade) for x, y in zip(left, right))
+                      if isinstance(left, tuple) else max(left, right, shade))
+            out.putpixel(a, shared)
+            out.putpixel(b, shared)
+    return out if out is not None else image
 
 
 def spread_preview_likely_from_metrics(metrics):
@@ -2878,6 +3499,7 @@ def apply_margin_crop(
     watermarks=False,
     skip_names=(),
     artifact_only_names=None,
+    background_colors=None,
     stop_requested_fn=None,
     log_fn=None,
 ):
@@ -2886,6 +3508,8 @@ def apply_margin_crop(
     *skip_names* are lower-cased file names to leave alone -- pages the user
     marked NoCrop, and pages carrying a custom crop, which must stay in their
     original coordinate space.
+    *background_colors*, when supplied, carries verified pre-crop RGB shades
+    to the KCC workers, keyed by the normalized file path without extension.
     """
     from PIL import Image
 
@@ -2917,6 +3541,10 @@ def apply_margin_crop(
             )
             if not applied:
                 continue
+            if background_colors is not None:
+                background = cropped_page_background(original, cropped)
+                if background is not None:
+                    background_colors[os.path.normcase(os.path.splitext(file_path)[0])] = background
             save_in_place(cropped, file_path)
             cropped_count += 1
         except UserWarning:

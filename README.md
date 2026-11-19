@@ -43,6 +43,18 @@ The Cleaning and Training sections are included. Pretrained model weights are
 not bundled; features that use them need the appropriate model files. The
 separate C++ desktop application is not part of this source distribution.
 
+## Preview and page processing
+
+The extra-margin editor includes a color picker: select a pixel in the preview,
+then apply the margins. Esc cancels picking without discarding the margin draft.
+Excluded pages are omitted from page-number recognition and its chapter sequence.
+
+Automatic padding preserves the page background through cropping and neural
+restoration, while keeping artwork out of generated margin texture.
+With Spread preview correction enabled, nearly uniform black split joins can
+receive a sparse near-black signal in the output image. Source files are not
+changed; whether the reader exposes spread preview still depends on the device.
+
 ## Manual setup and diagnostics
 
 After creating and activating a Python 3.14 virtual environment:

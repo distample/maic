@@ -1,4 +1,8 @@
 ﻿{
+    "conv.margin_picker": "Conta-gotas",
+    "conv.margin_pick": "Escolher a cor de preenchimento na pré-visualização",
+    "conv.margin_pick_hint": "Clique numa cor na pré-visualização · Esc para cancelar",
+    "conv.margin_pick_failed": "Não foi possível ler a cor da pré-visualização. Tente novamente.",
     "conv.preview_mode": "Modo de prévia",
     "conv.preview_crop": "Recorte",
     "conv.preview_final": "Imagem final",

@@ -700,6 +700,7 @@ function _convDetectedPageNumbers(decision){
 function _convPageNumberChapter(file,scope){
   let chapter='',folder=null;
   for(const current of ((S.convScanned||{})[scope]||[])){
+    if((S.convExcluded||{})[current.relPath])continue;
     const currentFolder=current.folder||String(current.relPath||'').replace(/\\/g,'/').split('/').slice(0,-1).join('/');
     if(currentFolder!==folder){folder=currentFolder;chapter=folder;}
     if((S.convBookmarks||{})[current.relPath])chapter=folder+'|'+current.relPath;
@@ -726,11 +727,15 @@ function _convRecordPageNumbers(path,decision){
   const owner=Object.entries(S.convScanned||{}).find(([,files])=>files.some(file=>file.path===path));
   const file=owner[1].find(file=>file.path===path);
   const minimum=_convPageNumberMinimum(file,owner[0]);
-  const numbers=_convDetectedPageNumbers(decision).filter(text=>Number(text)>=minimum);
+  const numbers=(S.convExcluded||{})[file.relPath]?[]:
+    _convDetectedPageNumbers(decision).filter(text=>Number(text)>=minimum);
   const changed=JSON.stringify(S.convPageNumberMatches[path]||[])!==JSON.stringify(numbers);
   if(numbers.length)S.convPageNumberMatches[path]=numbers;
   else delete S.convPageNumberMatches[path];
   return changed;
+}
+function _convPageNumberExclusionKey(files){
+  return JSON.stringify(files.filter(file=>(S.convExcluded||{})[file.relPath]).map(file=>file.path));
 }
 function _convUpdatePageNumberBadges(scope){
   const files=new Map((((S.convScanned||{})[scope])||[]).map(file=>[file.path,file]));
@@ -750,9 +755,30 @@ function _convRefreshPageNumberResults(scope){
   const preview=document.querySelector('.canvas-area');
   if(preview&&preview._refreshPageNumbers)preview._refreshPageNumbers(scope);
 }
+function _convRefreshPageNumberExclusions(scope){
+  _convPageNumberScans.delete(scope);
+  for(const file of ((S.convScanned||{})[scope]||[])){
+    if(S.convPageNumberMatches)delete S.convPageNumberMatches[file.path];
+  }
+  _invalidateCropCaches();
+  if(S.convMaicPageNumbers)_convScanPageNumbers(scope).catch(error=>console.error(error));
+}
+function _convToggleExcluded(relPath){
+  if(!S.convExcluded)S.convExcluded={};
+  if(S.convExcluded[relPath])delete S.convExcluded[relPath];
+  else S.convExcluded[relPath]=true;
+  for(const [scope,files] of Object.entries(S.convScanned||{})){
+    if(files.some(file=>file.relPath===relPath))_convRefreshPageNumberExclusions(scope);
+  }
+}
 const _convPageNumberScans=new Map();
 async function _convScanPageNumbers(scope){
   const files=(S.convScanned&&S.convScanned[scope])||[];
+  const exclusionKey=_convPageNumberExclusionKey(files);
+  const included=files.filter(file=>!(S.convExcluded||{})[file.relPath]);
+  for(const file of files){
+    if((S.convExcluded||{})[file.relPath]&&S.convPageNumberMatches)delete S.convPageNumberMatches[file.path];
+  }
   const revision=S._convPageNumberMemoryRevision;
   if(!scope||!files.length)return 0;
   const token={};_convPageNumberScans.set(scope,token);
@@ -762,11 +788,12 @@ async function _convScanPageNumbers(scope){
     // A whole-volume scan can monopolize the server while the opened page is
     // still loading. Let image and crop-preview requests run between batches.
     const batchSize=12;
-    for(let offset=0;offset<files.length;offset+=batchSize){
+    for(let offset=0;offset<included.length;offset+=batchSize){
       await new Promise(resolve=>setTimeout(resolve,30));
       if(_convPageNumberScans.get(scope)!==token||S.convScanned[scope]!==files||
+        _convPageNumberExclusionKey(files)!==exclusionKey||
         S._convPageNumberMemoryRevision!==revision||!S.convMaicPageNumbers)return matched;
-      const batch=files.slice(offset,offset+batchSize);
+      const batch=included.slice(offset,offset+batchSize);
       const response=await apiPost('/api/page-number-examples/rescan',{
         scope_path:scope,chapter_minimums:chapterMinimums,
         files:batch.map(file=>({path:file.path,relPath:file.relPath,chapter_key:_convPageNumberChapter(file,scope)}))
@@ -774,6 +801,7 @@ async function _convScanPageNumbers(scope){
       const result=await response.json();
       if(!response.ok||!result.ok)throw new Error(result.error||'Rescan failed');
       if(_convPageNumberScans.get(scope)!==token||S.convScanned[scope]!==files||
+        _convPageNumberExclusionKey(files)!==exclusionKey||
         S._convPageNumberMemoryRevision!==revision||!S.convMaicPageNumbers)return matched;
       chapterMinimums=result.chapterMinimums||chapterMinimums;
       batch.forEach(file=>_convRecordPageNumbers(file.path,null));
@@ -1133,20 +1161,21 @@ function _convBuildPreviewRequest(file){
   const editOps=(file&&file.relPath&&Array.isArray(S.convEditOps[file.relPath]))?S.convEditOps[file.relPath]:[];
   const noCrop=!!(file&&file.relPath&&S.convExclusions[file.relPath]&&S.convExclusions[file.relPath]['no-crop']);
   const customCrop=!!(file&&file.relPath&&S.convCustomCrop[file.relPath]);
+  const excluded=!!(file&&(S.convExcluded||{})[file.relPath]);
   const native=_isNativeFormat(S.convFormat);
   return {
     path:file.path,
     power:native?1.0:parseFloat(S.convCroppingPower)||1.0,
-    mode:native?0:parseInt(S.convCropping)||0,
+    mode:native?0:(excluded&&parseInt(S.convCropping)===2?1:parseInt(S.convCropping)||0),
     maic_crop:!!S.convMaicCrop&&!noCrop&&!customCrop,
     maic_margin_pct:Math.max(0,Math.min(10,parseFloat(S.convMaicMarginPct)||0)),
     maic_watermarks:!!S.convMaicWatermarks,
     maic_watermark_page_enabled:(!_convIsWatermarkReviewed(S.convExpandedSource||S.convSources[0]||'')||
       _convWatermarkMatchList(S.convExpandedSource||S.convSources[0]||'').includes(_convNormPath(file&&file.relPath))),
     watermark_revision:S._convWatermarkRevision||'0',
-    maic_page_numbers:!!S.convMaicPageNumbers,
+    maic_page_numbers:!!S.convMaicPageNumbers&&!excluded,
     page_number_scope:_convPageNumberScope(),
-    minimum_page_number:S.convMaicPageNumbers?_convPageNumberMinimum(file,_convPageNumberScope()):1,
+    minimum_page_number:S.convMaicPageNumbers&&!excluded?_convPageNumberMinimum(file,_convPageNumberScope()):1,
     page_number_memory_revision:S._convPageNumberMemoryRevision||'0',
     cleanup_method:S.cleanMethod||'lama',
     cleanup_padding:parseInt(S.maskPadding)||0,
@@ -1502,6 +1531,36 @@ function _convNavigatePreview(dir){
   return false;
 }
 
+function _convPreviewPixel(image,clientX,clientY){
+  const rect=image.getBoundingClientRect();
+  const width='naturalWidth' in image?image.naturalWidth:image.width;
+  const height='naturalHeight' in image?image.naturalHeight:image.height;
+  if(!width||!height||!rect.width||!rect.height)return null;
+  const style=getComputedStyle(image),fit=style.objectFit;
+  let drawWidth=rect.width,drawHeight=rect.height;
+  if(fit==='contain'||fit==='cover'||fit==='scale-down'){
+    let scale=(fit==='cover'?Math.max:Math.min)(rect.width/width,rect.height/height);
+    if(fit==='scale-down')scale=Math.min(1,scale);
+    drawWidth=width*scale;drawHeight=height*scale;
+  }
+  // Split-page frames shift object-position to show the selected crop region.
+  const position=(style.objectPosition||'50% 50%').split(/\s+/);
+  const offset=(value,space)=>value.endsWith('%')?space*parseFloat(value)/100:parseFloat(value)||0;
+  const x=clientX-rect.left-offset(position[0],rect.width-drawWidth);
+  const y=clientY-rect.top-offset(position[1]||position[0],rect.height-drawHeight);
+  if(clientX<rect.left||clientX>=rect.right||clientY<rect.top||clientY>=rect.bottom||
+    x<0||y<0||x>=drawWidth||y>=drawHeight)return null;
+  return {x:Math.min(width-1,Math.floor(x*width/drawWidth)),
+    y:Math.min(height-1,Math.floor(y*height/drawHeight))};
+}
+function _convSamplePreviewColor(image,point){
+  const canvas=document.createElement('canvas');canvas.width=1;canvas.height=1;
+  const ctx=canvas.getContext('2d');
+  ctx.fillStyle='#ffffff';ctx.fillRect(0,0,1,1);
+  ctx.drawImage(image,point.x,point.y,1,1,0,0,1,1);
+  const pixel=ctx.getImageData(0,0,1,1).data;
+  return '#'+Array.from(pixel.slice(0,3),value=>value.toString(16).padStart(2,'0')).join('');
+}
 function _getExtraMarginFillColor(relPath){
   if(relPath){const em=S.convExtraMargin[relPath];if(em&&em.color)return em.color;}
   return S._convExtraMarginColor||'#ffffff';
@@ -5469,8 +5528,7 @@ function renderConvert(app){
                   onContextmenu:e=>{
                     e.preventDefault();
                     if(e.altKey){
-                      if(S.convExcluded[f.relPath]){delete S.convExcluded[f.relPath];}
-                      else{S.convExcluded[f.relPath]=true;}
+                      _convToggleExcluded(f.relPath);
                     } else {
                       if(!_cropFeatureEnabled)return;
                       _convToggleNoCrop(f.relPath);
@@ -5501,7 +5559,7 @@ function renderConvert(app){
                 if(_isExtraMargin){info.append(h('div',{style:{fontSize:'0.6rem',color:'rgb(34,197,94)',fontWeight:'500',marginTop:'1px'}},'+ Margin'));}
                 const _hasEditOps=!!(S.convEditOps[f.relPath]&&S.convEditOps[f.relPath].length);
                 if(_hasEditOps){info.append(h('div',{style:{fontSize:'0.6rem',color:'var(--orange)',fontWeight:'500',marginTop:'1px'}},'\u270E Edit'));}
-                const pageNumbers=S.convMaicPageNumbers&&((S.convPageNumberMatches||{})[f.path]||[])
+                const pageNumbers=S.convMaicPageNumbers&&!isExcluded&&((S.convPageNumberMatches||{})[f.path]||[])
                   .filter(text=>Number(text)>=_convPageNumberMinimum(f,src));
                 info.append(h('div',{className:'conv-page-number-badge',
                   'data-page-number-scope':src,'data-page-number-path':f.path,hidden:!pageNumbers||!pageNumbers.length,
@@ -5671,8 +5729,7 @@ function renderConvert(app){
         color:_isExcluded?'var(--red)':'var(--text3)'},
         title:'Exclude page from conversion',
         onClick:()=>{
-          if(S.convExcluded[_cvFile.relPath]){delete S.convExcluded[_cvFile.relPath];}
-          else{S.convExcluded[_cvFile.relPath]=true;}
+          _convToggleExcluded(_cvFile.relPath);
           render();
         }});
       exBtn.append(h('span',{},'\u2715'));
@@ -5850,6 +5907,7 @@ function renderConvert(app){
     setTimeout(()=>{bmInp.focus();bmInp.select();},30);
   }
 
+  let setupMarginPicker=null;
   // Extra Margin inline editor
   if(_cvFile&&S._convExtraMarginEdit){
     const emKey=_cvFile.relPath;
@@ -5877,12 +5935,58 @@ function renderConvert(app){
     const emL=_mkEmField('L',emCur.left);
     const emR=_mkEmField('R',emCur.right);
     emBar.append(emT.wrap,emB.wrap,emL.wrap,emR.wrap);
-    // Color toggle (white / black)
+    // Keep the draft color and dimensions in this editor until Apply.
     const _emColStyle=(c)=>({width:'1.2rem',height:'1.2rem',borderRadius:'50%',cursor:'pointer',
       border:S._convExtraMarginColor===c?'2px solid rgb(34,197,94)':'2px solid var(--glass-border)',
       background:c,transition:'all .2s',flexShrink:0,boxShadow:c==='#ffffff'?'inset 0 0 0 1px rgba(0,0,0,0.12)':'none'});
-    emBar.append(h('button',{style:_emColStyle('#ffffff'),title:'White fill',onClick:()=>{S._convExtraMarginColor='#ffffff';localStorage.setItem('mcs_convExtraMarginColor','#ffffff');render();}}));
-    emBar.append(h('button',{style:_emColStyle('#000000'),title:'Black fill',onClick:()=>{S._convExtraMarginColor='#000000';localStorage.setItem('mcs_convExtraMarginColor','#000000');render();}}));
+    const whiteButton=h('button',{style:_emColStyle('#ffffff'),title:'White fill',onClick:()=>selectColor('#ffffff')});
+    const blackButton=h('button',{style:_emColStyle('#000000'),title:'Black fill',onClick:()=>selectColor('#000000')});
+    const swatch=h('span',{title:S._convExtraMarginColor,style:{..._emColStyle(S._convExtraMarginColor),cursor:'default'}});
+    const pickerStatus=h('span',{role:'status',style:{fontSize:'0.65rem',color:'var(--text3)'}},S._convExtraMarginColor);
+    let picking=false,pickerCanvas=null;
+    const stopPicking=()=>{
+      picking=false;if(pickerCanvas)pickerCanvas.classList.remove('margin-picking');
+      pickerButton.setAttribute('aria-pressed','false');
+      pickerStatus.textContent=S._convExtraMarginColor;
+    };
+    const selectColor=color=>{
+      S._convExtraMarginColor=color;localStorage.setItem('mcs_convExtraMarginColor',color);
+      Object.assign(whiteButton.style,_emColStyle('#ffffff'));
+      Object.assign(blackButton.style,_emColStyle('#000000'));
+      swatch.style.background=color;swatch.title=color;stopPicking();
+    };
+    const pickerButton=h('button',{type:'button','aria-pressed':'false',
+      title:t('conv.margin_pick','Pick fill color from preview'),
+      style:{padding:'0.25rem 0.5rem',borderRadius:'8px',fontSize:'0.7rem',cursor:'pointer',
+        background:'var(--glass2)',border:'1px solid var(--glass-border)',color:'var(--text)'},
+      onClick:()=>{
+        if(picking){stopPicking();return;}
+        picking=true;pickerCanvas.classList.add('margin-picking');pickerCanvas.tabIndex=0;pickerCanvas.focus();
+        pickerButton.setAttribute('aria-pressed','true');
+        pickerStatus.textContent=t('conv.margin_pick_hint','Click a color in the preview · Esc to cancel');
+      }},t('conv.margin_picker','Picker'));
+    emBar.append(whiteButton,blackButton,pickerButton,swatch,pickerStatus);
+    setupMarginPicker=canvas=>{
+      pickerCanvas=canvas;
+      for(const name of ['pointerdown','mousedown','dblclick'])canvas.addEventListener(name,event=>{
+        if(picking){event.preventDefault();event.stopImmediatePropagation();}
+      },true);
+      canvas.addEventListener('click',event=>{
+        if(!picking)return;
+        event.preventDefault();event.stopImmediatePropagation();
+        for(const image of Array.from(canvas.querySelectorAll('img,canvas.main-canvas')).reverse()){
+          if(getComputedStyle(image).display==='none')continue;
+          const point=_convPreviewPixel(image,event.clientX,event.clientY);
+          if(!point)continue;
+          try{selectColor(_convSamplePreviewColor(image,point));}
+          catch(error){pickerStatus.textContent=t('conv.margin_pick_failed','Could not read this preview color. Try again.');}
+          return;
+        }
+      },true);
+      canvas.addEventListener('keydown',event=>{
+        if(picking&&event.key==='Escape'){event.preventDefault();event.stopPropagation();stopPicking();pickerButton.focus();}
+      });
+    };
     const _emApply=()=>{
       const t2=Math.max(0,parseInt(emT.inp.value,10)||0);
       const b2=Math.max(0,parseInt(emB.inp.value,10)||0);
@@ -6043,6 +6147,7 @@ function renderConvert(app){
   // Encoding-normalized comment.
   const ca=h('div',{className:'canvas-area',style:Object.assign({minWidth:_CONV_CANVAS_MIN_W_PX+'px'},
     S.convViewIdx!==null?{}:{alignItems:'flex-start',justifyContent:'flex-start',overflow:'auto'})});
+  if(setupMarginPicker)setupMarginPicker(ca);
 
   if(_cvFile&&_convUsesFinalPreview()){
     _drawFinalPreview(ca,_cvFile);
@@ -7777,6 +7882,7 @@ function renderConvert(app){
         const detected={};(r['watermark-matches']||[]).forEach(k=>{const rel=_convNormPath(k);if(normRelPaths.has(rel))detected[rel]=1;});
         S.convWatermarkMatches={...(S.convWatermarkMatches||{}),[src]:detected};
         S.convWatermarkReviewed={...(S.convWatermarkReviewed||{}),[src]:!!r['watermark-matches-saved']};
+        _convRefreshPageNumberExclusions(src);
         _invalidateCropCaches();render();
       },
       onMouseover:function(){this.style.color='var(--accent)';},
@@ -7789,6 +7895,7 @@ function renderConvert(app){
         files.forEach(f=>{if(f.relPath){delete S.convExclusions[f.relPath];delete S.convCustomCrop[f.relPath];delete S.convCustomSplit[f.relPath];delete S.convExcluded[f.relPath];delete S.convExtraMargin[f.relPath];delete S.convEditOps[f.relPath];}});
         S.convWatermarkMatches={...(S.convWatermarkMatches||{}),[src]:{}};
         S.convWatermarkReviewed={...(S.convWatermarkReviewed||{}),[src]:true};
+        _convRefreshPageNumberExclusions(src);
         _invalidateCropCaches();render();
       },
       onMouseover:function(){this.style.color='var(--red)';},
@@ -7819,7 +7926,7 @@ function renderConvert(app){
         const tag=h('span',{style:{display:'inline-flex',alignItems:'center',gap:'0.2rem',
           fontSize:'0.6rem',color:'var(--red)',background:'rgba(248,113,113,0.08)',border:'1px solid rgba(248,113,113,0.2)',
           borderRadius:'var(--radius-xs)',padding:'0.1rem 0.35rem',cursor:'pointer'},
-          onClick:()=>{delete S.convExcluded[name];render();}});
+          onClick:()=>{_convToggleExcluded(name);render();}});
         tag.append(h('span',{},'\u2715 '+name));tag.append(h('span',{style:{opacity:'0.5'}},'\u2715'));
         tagGrid.append(tag);
       });
@@ -8070,8 +8177,7 @@ document.addEventListener('keydown',e=>{
     if(e.key==='Backspace'){e.preventDefault();convResetView();render();return;}
     if((e.key==='x'||e.key==='ч')&&cvf){
       e.preventDefault();
-      if(S.convExcluded[cvf.relPath]){delete S.convExcluded[cvf.relPath];}
-      else{S.convExcluded[cvf.relPath]=true;}
+      _convToggleExcluded(cvf.relPath);
       render();return;
     }
     if((e.key==='b'||e.key==='и')&&cvf){
@@ -8085,8 +8191,7 @@ document.addEventListener('keydown',e=>{
     }
     if(e.key==='Alt'&&cvf){
       e.preventDefault();
-      if(S.convExcluded[cvf.relPath]){delete S.convExcluded[cvf.relPath];}
-      else{S.convExcluded[cvf.relPath]=true;}
+      _convToggleExcluded(cvf.relPath);
       render();return;
     }
     return;

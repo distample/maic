@@ -1,4 +1,8 @@
 ﻿{
+    "conv.margin_picker": "Пипетка",
+    "conv.margin_pick": "Выбрать цвет заливки с превью",
+    "conv.margin_pick_hint": "Нажмите на цвет в превью · Esc — отмена",
+    "conv.margin_pick_failed": "Не удалось прочитать цвет превью. Попробуйте ещё раз.",
     "conv.preview_mode": "Режим превью",
     "conv.preview_crop": "Обрезка",
     "conv.preview_final": "Итоговое изображение",

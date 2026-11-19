@@ -1,4 +1,8 @@
 ﻿{
+    "conv.margin_picker": "Picker",
+    "conv.margin_pick": "Pick fill color from preview",
+    "conv.margin_pick_hint": "Click a color in the preview · Esc to cancel",
+    "conv.margin_pick_failed": "Could not read this preview color. Try again.",
     "conv.preview_mode": "Preview mode",
     "conv.preview_crop": "Crop",
     "conv.preview_final": "Final image",

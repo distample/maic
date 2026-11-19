@@ -1450,6 +1450,64 @@ def _crop_foreground_mask(image: Image.Image, ignore_mask=None):
     return finish(*_raw_crop_foreground(image))
 
 
+def _clear_sparse_side_specks(foreground):
+    """Ignore tiny disconnected scan flecks beyond the page's side content.
+
+    On dark scans, several three-pixel white flecks can form a short run of
+    active columns even though the artwork ends much farther in. Only a
+    sparse collection of small components beyond substantial page content
+    qualifies; a detached caption or a single intentional mark stays put.
+    This mask is used for finding bounds, never for altering retained pixels.
+    """
+    from . import models
+
+    height, width = foreground.shape
+    if min(width, height) < 300:
+        return foreground
+    count, labels, stats, _ = models.cv2.connectedComponentsWithStats(
+        foreground.astype(models.np.uint8), connectivity=8,
+    )
+    if count <= 1:
+        return foreground
+    components = stats[1:]
+    areas = components[:, models.cv2.CC_STAT_AREA]
+    small_area = max(24, round(min(width, height) * 0.015))
+    small_span = max(8, round(min(width, height) * 0.005))
+    tiny = (
+        (areas <= small_area)
+        & (components[:, models.cv2.CC_STAT_WIDTH] <= small_span)
+        & (components[:, models.cv2.CC_STAT_HEIGHT] <= small_span)
+    )
+    substantial = areas >= max(64, round(min(width, height) * 0.04))
+    if not models.np.any(substantial):
+        return foreground
+    content_left = int(models.np.min(components[substantial, models.cv2.CC_STAT_LEFT]))
+    content_right = int(models.np.max(
+        components[substantial, models.cv2.CC_STAT_LEFT]
+        + components[substantial, models.cv2.CC_STAT_WIDTH] - 1
+    ))
+    discard = models.np.zeros(count - 1, dtype=bool)
+    for side, boundary, outside in (
+        ("left", content_left, components[:, models.cv2.CC_STAT_LEFT]
+         + components[:, models.cv2.CC_STAT_WIDTH] - 1 < content_left),
+        ("right", content_right, components[:, models.cv2.CC_STAT_LEFT] > content_right),
+    ):
+        margin_width = boundary if side == "left" else width - 1 - boundary
+        if margin_width < max(40, round(width * 0.08)):
+            continue
+        flecks = tiny & outside
+        if int(models.np.count_nonzero(flecks)) < 6:
+            continue
+        if int(models.np.sum(areas[flecks])) > margin_width * height * 0.003:
+            continue
+        discard |= flecks
+    if not models.np.any(discard):
+        return foreground
+    cleaned = foreground.copy()
+    cleaned[models.np.isin(labels, models.np.flatnonzero(discard) + 1)] = False
+    return cleaned
+
+
 def _raw_crop_foreground(image: Image.Image):
     """The crop's content mask before any scan lines are cleared from it."""
     from . import models
@@ -1971,6 +2029,7 @@ def _find_blank_edge_candidate(
     if width < 8 or height < 8:
         return None
     foreground, background = _crop_foreground_mask(image, ignore_mask)
+    foreground = _clear_sparse_side_specks(foreground)
     if background is not None:
         background_luma = (77 * background[0] + 150 * background[1] + 29 * background[2]) >> 8
         if background_luma < 128 and float(models.np.mean(foreground)) < 0.12:
@@ -4110,15 +4169,28 @@ def create_autonomous_blueprint(archive_snapshot=lambda: {}) -> Blueprint:
         from .kcc_scan import _load_image_bytes
 
         sequence = PageNumberSequence(data.get("chapter_minimums"))
+        excluded = {
+            str(value).replace("\\", "/").casefold()
+            for value in data.get("excluded_files", []) if isinstance(value, str)
+        } if isinstance(data.get("excluded_files"), list) else set()
         matches = []
         failed = 0
+        scanned = 0
+        skipped_excluded = 0
         # This is an explicit preview action. A bounded scan keeps a malformed
         # request from monopolizing the UI worker.
         for raw_item in raw_files[:500]:
             item = raw_item if isinstance(raw_item, dict) else {"path": raw_item}
             source_path = str(item.get("path") or "")
+            if item.get("excluded") is True or any(
+                str(value).replace("\\", "/").casefold() in excluded
+                for value in (source_path, item.get("relPath") or "")
+            ):
+                skipped_excluded += 1
+                continue
             if not source_path:
                 continue
+            scanned += 1
             try:
                 image_bytes = _load_image_bytes(source_path, state.get("allowed_read_roots", []))
                 if not image_bytes:
@@ -4144,7 +4216,8 @@ def create_autonomous_blueprint(archive_snapshot=lambda: {}) -> Blueprint:
                 failed += 1
         return jsonify({
             "ok": True,
-            "scanned": min(len(raw_files), 500),
+            "scanned": scanned,
+            "skippedExcluded": skipped_excluded,
             "matchedCount": len(matches),
             "failed": failed,
             "matches": matches,
